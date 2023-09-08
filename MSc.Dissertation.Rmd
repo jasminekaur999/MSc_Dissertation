@@ -1,0 +1,798 @@
+---
+title: "Simulacrum data set"
+author: "Jasmine K"
+date: "2023-04-11"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r}
+#Loading the libraries 
+
+library(readxl)
+library(tidyverse)
+library(mgcv)
+library(modelr)
+library(janitor)
+library(flexsurv)
+
+
+#setting working directory
+
+setwd("/Users/jasminekaur/Library/CloudStorage/OneDrive-SharedLibraries-UniversityofBath/Karim Anaya-Izquierdo - Jasmine_dissertation")
+
+
+
+```
+
+
+
+```{r}
+# Loading the data
+
+tumour_data <-
+  read_csv("data/simulacrum_release_v1.2.0.2017/data/sim_av_tumour.csv") %>%
+    clean_names()
+
+patient_data <-
+  read_csv("data/simulacrum_release_v1.2.0.2017/data/sim_av_patient.csv") %>%
+    clean_names()
+
+load("lung_cancer_data.Rdata")
+```
+
+
+```{r}
+#Formatting and cleaning the data
+
+lung_cancer_data <-
+  tumour_data %>%
+    filter(site_icd10_o2_3char == "C34",
+
+           year(diagnosisdatebest) == 2013)
+
+
+
+dim(lung_cancer_data)
+
+lung_cancer_data <-left_join(lung_cancer_data,patient_data,by=join_by(patientid))
+
+dim(lung_cancer_data)
+
+
+#creating the time variable
+
+lung_cancer_data <-
+  lung_cancer_data %>%
+    mutate(time = as.numeric(interval(diagnosisdatebest,vitalstatusdate),'years'))
+
+# creating age groups
+
+lung_cancer_data<-
+  lung_cancer_data %>% 
+    filter(newvitalstatus != "X") %>% 
+     mutate(age_cut = cut(age,breaks=c(0,seq(5,90,by=10),105)))
+      
+#Removing all the missing values
+
+lung_cancer_data <-
+  lung_cancer_data %>% 
+    filter(newvitalstatus != "X", # Removes missing censoring values
+           time >0 ) %>%  # removes zero times
+      mutate(censoring = ifelse(newvitalstatus=="D",1,0), # make censoring variable binary
+             sex.x = factor(sex.x),
+             sex.x = fct_recode(sex.x,
+                                "male" = "1",
+                                "female" = "2"),
+             sex.y = NULL) # removed redundant sex variable
+```
+  
+
+#Kaplan-Meier analysis
+
+```{r}
+#Kaplan-Meier plot for the variable sex
+
+km <- survfit(Surv(time) ~ sex.x, data = lung_cancer_data)
+plot(km, xlab = "time",  ylab = "sex") 
+```
+
+```{r}
+#Kaplan-Meier plot for the variable age
+
+km <- survfit(Surv(time) ~ age_cut , data = lung_cancer_data)
+plot(km, xlab = "time",  ylab = "age") 
+```
+
+```{r}
+#Kaplan-Meier plot for the variable cancercareplanintent
+
+km <- survfit(Surv(time) ~ cancercareplanintent , data = lung_cancer_data)
+plot(km, xlab = "time",  ylab = "cancercareplanintent") 
+```
+
+
+```{r}
+n_grid <-200
+max_time <-8
+```
+
+#APGW analysis
+
+```{r}
+#creating a custom APGW distribution 
+
+hapgw <- function(x, phi, lambda, gamma, kappa, log=FALSE){
+  lambda*gamma*phi^gamma*(x)^{gamma-1}*(1+((phi*x)^gamma)/(kappa+1))^(kappa-1)
+}
+Hapgw <- function(x, phi, lambda, gamma, kappa, log=FALSE){
+  lambda*(kappa+1)/kappa*((1+(phi*x)^gamma/(kappa+1))^kappa-1)
+}
+kappa_trans <- function(x){log(x+1)}
+kappa_invtrans<- function(x){exp(x)-1}
+
+custom.apgw <- list(
+  name="apgw",
+  pars=c("phi","lambda","gamma","kappa"),
+  location="lambda",
+  transforms=c(log,log,log,kappa_trans),
+  inv.transforms=c(exp,exp,exp,kappa_invtrans),
+  inits=function(t){c(1,median(t)/log(2),1,1)})
+```
+
+
+```{r}
+# APGW distribution with frailty parameter 
+
+hapgwfrailty <- function(x, phi, gamma, kappa, theta, log=FALSE){
+  hapgw(x, phi, theta, gamma, kappa, log=FALSE)
+}
+Hapgwfrailty <- function(x, phi, gamma, kappa, theta, log=FALSE){
+  Hapgw(x, phi, theta, gamma, kappa, log=FALSE)
+}
+custom.apgwfrailty <- list(
+  name="apgwfrailty",
+  pars=c("phi","gamma","kappa","theta"),
+  location="theta",
+  transforms=c(log,log,kappa_trans,log),
+  inv.transforms=c(exp,exp,kappa_invtrans,exp),
+  inits=function(t) c(1,1,1,median(t)/log(2))
+)
+```
+
+
+
+```{r}
+# Fit an APGW model with farilty parameter for sex
+
+
+mod_sex_apgw_frailty <- flexsurvreg(Surv(time, censoring) ~ sex.x, 
+                    data = lung_cancer_data,
+                    dist = custom.apgwfrailty)
+
+pred_sex_apgw_frailty <-predict(mod_sex_apgw_frailty,
+         newdata  = data.frame(sex.x = c("male","female")),
+         times    = seq(0.01,max_time,length=n_grid),
+         conf.int = T,
+         type     = "survival")
+
+
+pred_sex_apgw_frailty<-
+  tidyr::unnest(data   = pred_sex_apgw_frailty, 
+                        col   = .pred) %>% 
+    mutate( sex = rep(c("male","female"),each = n_grid)) %>% 
+      rename(time = .time,
+             survival = .pred_survival,
+             low = .pred_lower,
+             upper = .pred_upper)
+```
+
+```{r}
+# plotting apgw frailty for variable sex
+
+pred_sex_apgw_frailty %>% 
+  ggplot(aes(x = time,
+         y = survival,
+         col = sex)) + 
+  geom_line()
+
+
+pred_sex_apgw_frailty %>% 
+  ggplot(aes(x = time,
+         y = survival)) + 
+  geom_line() +
+    facet_wrap(~sex)
+```
+
+
+
+
+```{r}
+# Fit an APGW model with frailty parameter for age
+
+
+mod_age_apgw_frailty <- flexsurvreg(Surv(time, censoring) ~ age_cut, 
+                    data = lung_cancer_data,
+                    dist = custom.apgwfrailty)
+
+pred_age_apgw_frailty <-predict(mod_age_apgw_frailty,
+         newdata  = data.frame(age_cut = c("(0,5]","(85,105]","(25,35]","(35,45]","(45,55]","(55,65]","(65,75]","(75,85]")),
+         times    = seq(0.01,max_time,length=n_grid),
+         conf.int = T,
+         type     = "survival")
+
+
+pred_age_apgw_frailty<-
+  tidyr::unnest(data   = pred_age_apgw_frailty, 
+                        col   = .pred) %>% 
+  mutate( age = rep(c("(0,5]","(85,105]","(25,35]","(35,45]","(45,55]","(55,65]","(65,75]","(75,85]"),each = n_grid)) %>% 
+      rename(time = .time,
+             survival = .pred_survival,
+             low = .pred_lower,
+             upper = .pred_upper)
+```
+
+```{r}
+# plotting apgw frailty for variable age
+
+pred_age_apgw_frailty %>% 
+  ggplot(aes(x = time,
+         y = survival,
+         col = age)) + 
+  geom_line()
+
+
+pred_age_apgw_frailty %>% 
+  ggplot(aes(x = time,
+         y = survival)) + 
+  geom_line() +
+    facet_wrap(~age)
+```
+
+
+
+```{r}
+# Fit an APGW model with frailty parameter for variable cancercareplanintent
+
+
+mod_ccpl_apgw_frailty <- flexsurvreg(Surv(time, censoring) ~ cancercareplanintent, 
+                    data = lung_cancer_data,
+                    dist = custom.apgwfrailty)
+
+pred_ccpl_apgw_frailty <-predict(mod_ccpl_apgw_frailty,
+         newdata  = data.frame(cancercareplanintent = c("C","Z","X")),
+         times    = seq(0.01,max_time,length=n_grid),
+         conf.int = T,
+         type     = "survival")
+
+
+pred_ccpl_apgw_frailty<-
+  tidyr::unnest(data   = pred_ccpl_apgw_frailty, 
+                        col   = .pred) %>% 
+  mutate( cancercareplanintent = rep(c("C","Z","X"),each = n_grid)) %>% 
+      rename(time = .time,
+             survival = .pred_survival,
+             low = .pred_lower,
+             upper = .pred_upper)
+```
+
+```{r}
+# plotting apgw frailty for variable cancercareplanintent
+
+pred_ccpl_apgw_frailty %>% 
+  ggplot(aes(x = time,
+         y = survival,
+         col = cancercareplanintent)) + 
+  geom_line()
+
+
+pred_ccpl_apgw_frailty %>% 
+  ggplot(aes(x = time,
+         y = survival)) + 
+  geom_line() +
+    facet_wrap(~cancercareplanintent)
+```
+
+
+
+```{r}
+# custom APGW distribution with scale parameter
+
+hapgwscale<- function(x, lambda, gamma, kappa, theta, log=FALSE){
+   hapgw(x, theta, lambda, gamma, kappa, log=FALSE)
+}
+Hapgwscale <- function(x, lambda, gamma, kappa, theta, log=FALSE){
+   Hapgw(x, theta, lambda, gamma, kappa, log=FALSE)
+}
+custom.apgwscale <- list(
+  name="apgwscale",
+  pars=c("lambda","gamma","kappa","theta"),
+  location="theta",
+  transforms=c(log,log,kappa_trans,log),
+  inv.transforms=c(exp,exp,kappa_invtrans,exp),
+  inits=function(t) c(1,1,0.5,2)
+)
+```
+
+
+```{r}
+# Fit an APGW model for scale parameter for the variable sex
+
+
+mod_sex_apgw_scale <- flexsurvreg(Surv(time, censoring) ~ sex.x,
+                    data = lung_cancer_data,
+                    dist = custom.apgwscale)
+
+pred_sex_apgw_scale <-predict(mod_sex_apgw_scale,
+         newdata  = data.frame(sex.x = c("male","female")),
+         times    = seq(0.01,max_time,length=n_grid),
+         conf.int = T,
+         type     = "survival")
+
+
+pred_sex_apgw_scale<-
+  tidyr::unnest(data   = pred_sex_apgw_scale, 
+                        col   = .pred) %>% 
+    mutate( sex = rep(c("male","female"),each = n_grid)) %>% 
+      rename(time = .time,
+             survival = .pred_survival,
+             low = .pred_lower,
+             upper = .pred_upper)
+
+```
+
+
+```{r}
+
+#plotting APGW distribution for scale parameter for variable sex
+
+pred_sex_apgw_scale %>% 
+  ggplot(aes(x = time,
+         y = survival,
+         col = sex)) + 
+  geom_line()
+
+
+pred_sex_apgw_scale %>% 
+  ggplot(aes(x = time,
+         y = survival)) + 
+  geom_line() +
+    facet_wrap(~sex)
+```
+
+
+
+
+```{r}
+# Fit an APGW model for scale parameter for the variable age
+
+
+mod_age_apgw_scale <- flexsurvreg(Surv(time, censoring) ~ age_cut,
+                    data = lung_cancer_data,
+                    dist = custom.apgwscale)
+
+pred_age_apgw_scale <-predict(mod_age_apgw_scale,
+         newdata  = data.frame(age_cut = c("(0,5]","(85,105]","(5,15]","(15,25]","(25,35]","(35,45]","(45,55]","(55,65]","(65,75]","(75,85]")),
+         times    = seq(0.01,max_time,length=n_grid),
+         conf.int = T,
+         type     = "survival")
+
+
+pred_age_apgw_scale<-
+  tidyr::unnest(data   = pred_age_apgw_scale, 
+                        col   = .pred) %>% 
+    mutate( age = rep(c("(0,5]","(85,105]","(5,15]","(15,25]","(25,35]","(35,45]","(45,55]","(55,65]","(65,75]","(75,85]"),each = n_grid)) %>% 
+      rename(time = .time,
+             survival = .pred_survival,
+             low = .pred_lower,
+             upper = .pred_upper)
+
+```
+
+```{r}
+
+#plotting APGW distribution for scale parameter for variable age
+
+pred_age_apgw_scale %>% 
+  ggplot(aes(x = time,
+         y = survival,
+         col = age)) + 
+  geom_line()
+
+
+pred_age_apgw_scale %>% 
+  ggplot(aes(x = time,
+         y = survival)) + 
+  geom_line() +
+    facet_wrap(~age)
+```
+
+
+
+```{r}
+# Fit an APGW model for scale parameter for the variable cancercareplanintent
+
+
+mod_ccpl_apgw_scale <- flexsurvreg(Surv(time, censoring) ~ cancercareplanintent,
+                    data = lung_cancer_data,
+                    dist = custom.apgwscale)
+
+pred_ccpl_apgw_scale <-predict(mod_ccpl_apgw_scale,
+         newdata  = data.frame(cancercareplanintent = c("C","Z","X")),
+         times    = seq(0.01,max_time,length=n_grid),
+         conf.int = T,
+         type     = "survival")
+
+
+pred_ccpl_apgw_scale<-
+  tidyr::unnest(data   = pred_ccpl_apgw_scale, 
+                        col   = .pred) %>% 
+  mutate( cancercareplanintent = rep(c("C","Z","X"),each = n_grid))%>% 
+      rename(time = .time,
+             survival = .pred_survival,
+             low = .pred_lower,
+             upper = .pred_upper)
+
+```
+
+```{r}
+
+#plotting APGW distribution for scale parameter for variable cancercareplanintent
+
+pred_ccpl_apgw_scale %>% 
+  ggplot(aes(x = time,
+         y = survival,
+         col = cancercareplanintent)) + 
+  geom_line()
+
+
+pred_ccpl_apgw_scale %>% 
+  ggplot(aes(x = time,
+         y = survival)) + 
+  geom_line() +
+    facet_wrap(~cancercareplanintent)
+```
+
+
+
+
+```{r}
+# APGW with tilt parameter
+
+H_lleg <- function(x, theta){log(1+theta*(exp(x)-1))}
+
+hapgwtilt <- function(x, phi, lambda, gamma, kappa, theta, log=FALSE){
+  z <- Hapgw(x, phi, lambda, gamma, kappa)
+  num <- theta * hapgw(x, phi, lambda, gamma, kappa) * exp(z)
+  den <- exp(H_lleg(z, theta))
+  y <- num/den
+  return(y)
+}
+Hapgwtilt <- function(x, phi, lambda, gamma, kappa, theta, log=FALSE){
+  y <- Hapgw(x, phi, lambda, gamma, kappa, log=FALSE)
+  y <- H_lleg(y, theta)
+  return(y)
+}
+custom.apgwtilt <- list(
+  name="apgwtilt",
+  pars=c("phi","lambda","gamma","kappa","theta"),
+  location="theta",
+  transforms=c(log,log,log,kappa_trans,log),
+  inv.transforms=c(exp,exp,exp,kappa_invtrans,exp),
+  inits=function(t) c(1,median(t)/log(2),1,1,1)
+)
+```
+
+
+
+```{r}
+# Fit an APGW model with tilt parameter for sex
+
+
+mod_sex_apgw_tilt <- flexsurvreg(Surv(time, censoring) ~ sex.x, 
+                    data = lung_cancer_data,
+                    dist = custom.apgwtilt)
+
+pred_sex_apgw_tilt <-predict(mod_sex_apgw_tilt,
+         newdata  = data.frame(sex.x = c("male","female")),
+         times    = seq(0.01,max_time,length=n_grid),
+         conf.int = T,
+         type     = "survival")
+
+
+pred_sex_apgw_tilt<-
+  tidyr::unnest(data   = pred_sex_apgw_tilt, 
+                        col   = .pred) %>% 
+    mutate( sex = rep(c("male","female"),each = n_grid)) %>% 
+      rename(time = .time,
+             survival = .pred_survival,
+             low = .pred_lower,
+             upper = .pred_upper)
+
+```
+
+```{r}
+#plotting APGW model with tilt parameter for sex
+
+
+pred_sex_apgw_tilt %>% 
+  ggplot(aes(x = time,
+         y = survival,
+         col = sex)) + 
+  geom_line()
+
+
+pred_sex_apgw_tilt %>% 
+  ggplot(aes(x = time,
+         y = survival)) + 
+  geom_line() +
+    facet_wrap(~sex)
+```
+
+
+
+```{r}
+# Fit an APGW model with tilt parameter for age
+
+
+mod_age_apgw_tilt <- flexsurvreg(Surv(time, censoring) ~ age_cut, 
+                    data = lung_cancer_data,
+                    dist = custom.apgwtilt)
+
+pred_age_apgw_tilt <-predict(mod_age_apgw_tilt,
+         newdata  = data.frame(age_cut = c("(0,5]","(85,105]","(25,35]","(35,45]","(45,55]","(55,65]","(65,75]","(75,85]")),
+         times    = seq(0.01,max_time,length=n_grid),
+         conf.int = T,
+         type     = "survival")
+
+
+pred_age_apgw_tilt<-
+  tidyr::unnest(data   = pred_age_apgw_tilt, 
+                        col   = .pred) %>% 
+    mutate( age = rep(c("(0,5]","(85,105]","(25,35]","(35,45]","(45,55]","(55,65]","(65,75]","(75,85]"),each = n_grid)) %>% 
+      rename(time = .time,
+             survival = .pred_survival,
+             low = .pred_lower,
+             upper = .pred_upper)
+
+```
+
+```{r}
+#plotting APGW model with tilt parameter for age
+
+
+pred_age_apgw_tilt %>% 
+  ggplot(aes(x = time,
+         y = survival,
+         col = age)) + 
+  geom_line()
+
+
+pred_age_apgw_tilt %>% 
+  ggplot(aes(x = time,
+         y = survival)) + 
+  geom_line() +
+    facet_wrap(~age)
+```
+
+
+
+
+```{r}
+# Fit an APGW model with tilt parameter for cancercareplanintent
+
+
+mod_ccpl_apgw_tilt <- flexsurvreg(Surv(time, censoring) ~ cancercareplanintent, 
+                    data = lung_cancer_data,
+                    dist = custom.apgwtilt)
+
+pred_ccpl_apgw_tilt <-predict(mod_ccpl_apgw_tilt,
+         newdata  = data.frame(cancercareplanintent = c("C","Z","X")),
+         times    = seq(0.01,max_time,length=n_grid),
+         conf.int = T,
+         type     = "survival")
+
+
+pred_ccpl_apgw_tilt<-
+  tidyr::unnest(data   = pred_ccpl_apgw_tilt, 
+                        col   = .pred) %>% 
+   mutate( cancercareplanintent = rep(c("C","Z","X"),each = n_grid))%>% 
+      rename(time = .time,
+             survival = .pred_survival,
+             low = .pred_lower,
+             upper = .pred_upper)
+
+```
+
+```{r}
+#plotting APGW model with tilt parameter for cancercareplanintent
+
+
+pred_ccpl_apgw_tilt %>% 
+  ggplot(aes(x = time,
+         y = survival,
+         col = cancercareplanintent)) + 
+  geom_line()
+
+
+pred_ccpl_apgw_tilt %>% 
+  ggplot(aes(x = time,
+         y = survival)) + 
+  geom_line() +
+    facet_wrap(~cancercareplanintent)
+```
+
+
+
+
+```{r}
+# APGW with hybrid parameters (scale and frailty)
+hapgwhybrid<- function(x, lambda, gamma, kappa, theta1,theta2, log=FALSE){
+   hapgw(x, theta1, lambda, gamma, kappa, log=FALSE)*theta2/theta1
+}
+Hapgwhybrid <- function(x, lambda, gamma, kappa, theta1,theta2, log=FALSE){
+   Hapgw(x, theta1, lambda, gamma, kappa, log=FALSE)*theta2/theta1
+}
+custom.apgwhybrid <- list(
+  name="apgwhybrid",
+  pars=c("lambda","gamma","kappa","theta1","theta2"),
+  location="theta1",
+  transforms=c(log,log,kappa_trans,log,log),
+  inv.transforms=c(exp,exp,kappa_invtrans,exp,exp),
+  inits=function(t) c(1,1,1,1,3)
+)
+
+```
+
+
+
+```{r}
+# Fit an APGW model with hybrid parameters (scale and frailty) for sex
+
+
+mod_sex_apgw_hybrid <- flexsurvreg(Surv(time, censoring) ~ sex.x,
+                    data = lung_cancer_data,
+                    dist = custom.apgwhybrid,
+                    anc = list("theta2"= ~sex.x))
+
+pred_sex_apgw_hybrid <-predict(mod_sex_apgw_hybrid,
+         newdata  = data.frame(sex.x = c("male","female")),
+         times    = seq(0.01,max_time,length=n_grid),
+         conf.int = T,
+         type     = "survival")
+
+
+pred_sex_apgw_hybrid<-
+  tidyr::unnest(data   = pred_sex_apgw_hybrid, 
+                        col   = .pred) %>% 
+  mutate( sex = rep(c("male","female"),each = n_grid)) %>% 
+      rename(time = .time,
+             survival = .pred_survival,
+             low = .pred_lower,
+             upper = .pred_upper)
+
+
+
+```
+
+```{r}
+#plotting APGW model with hybrid parameter for sex
+
+
+pred_sex_apgw_hybrid %>% 
+  ggplot(aes(x = time,
+         y = survival,
+         col = sex)) + 
+  geom_line()
+
+
+pred_sex_apgw_hybrid %>% 
+  ggplot(aes(x = time,
+         y = survival)) + 
+  geom_line() +
+    facet_wrap(~sex)
+```
+
+
+
+
+```{r}
+# Fit an APGW model with hybrid parameters (scale and frailty) for age
+
+
+mod_age_apgw_hybrid <- flexsurvreg(Surv(time, censoring) ~ age_cut,
+                    data = lung_cancer_data,
+                    dist = custom.apgwhybrid,
+                    anc = list("theta2"= ~age_cut))
+
+pred_age_apgw_hybrid <-predict(mod_age_apgw_hybrid,
+         newdata  = data.frame(age_cut = c("(0,5]","(85,105]","(5,15]","(15,25]","(25,35]","(35,45]","(45,55]","(55,65]","(65,75]","(75,85]")),
+         times    = seq(0.01,max_time,length=n_grid),
+         conf.int = T,
+         type     = "survival")
+
+
+pred_age_apgw_hybrid<-
+  tidyr::unnest(data   = pred_age_apgw_hybrid, 
+                        col   = .pred) %>% 
+  mutate( age = rep(c("(0,5]","(85,105]","(5,15]","(15,25]","(25,35]","(35,45]","(45,55]","(55,65]","(65,75]","(75,85]"),each = n_grid)) %>% 
+      rename(time = .time,
+             survival = .pred_survival,
+             low = .pred_lower,
+             upper = .pred_upper)
+
+
+
+```
+
+```{r}
+#plotting APGW model with hybrid parameter for age
+
+
+pred_age_apgw_hybrid %>% 
+  ggplot(aes(x = time,
+         y = survival,
+         col = age)) + 
+  geom_line()
+
+
+pred_age_apgw_hybrid %>% 
+  ggplot(aes(x = time,
+         y = survival)) + 
+  geom_line() +
+    facet_wrap(~age)
+```
+
+
+
+
+```{r}
+# Fit an APGW model with hybrid parameters (scale and frailty) for cancercareplanintent
+
+
+mod_ccpl_apgw_hybrid <- flexsurvreg(Surv(time, censoring) ~ cancercareplanintent,
+                    data = lung_cancer_data,
+                    dist = custom.apgwhybrid,
+                    anc = list("theta2"= ~cancercareplanintent))
+
+pred_ccpl_apgw_hybrid <-predict(mod_ccpl_apgw_hybrid,
+         newdata  = data.frame(cancercareplanintent = c("C","Z","X")),
+         times    = seq(0.01,max_time,length=n_grid),
+         conf.int = T,
+         type     = "survival")
+
+
+pred_ccpl_apgw_hybrid<-
+  tidyr::unnest(data   = pred_ccpl_apgw_hybrid, 
+                        col   = .pred) %>% 
+  mutate( cancercareplanintent = rep(c("C","Z","X"),each = n_grid)) %>% 
+      rename(time = .time,
+             survival = .pred_survival,
+             low = .pred_lower,
+             upper = .pred_upper)
+
+
+
+```
+
+```{r}
+#plotting APGW model with hybrid parameter for cancercareplanintent
+
+
+pred_ccpl_apgw_hybrid %>% 
+  ggplot(aes(x = time,
+         y = survival,
+         col = cancercareplanintent)) + 
+  geom_line()
+
+
+pred_ccpl_apgw_hybrid %>% 
+  ggplot(aes(x = time,
+         y = survival)) + 
+  geom_line() +
+    facet_wrap(~cancercareplanintent)
+```
